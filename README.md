@@ -86,4 +86,4 @@ The workflow validates the package and uses npm OIDC Trusted Publishing with pub
 
 ## License
 
-[ISC](LICENSE)
+[MIT](LICENSE)
