@@ -9,5 +9,7 @@ assert.match(source, /Origin tracking is provenance only/i, "guidelines should s
 assert.match(source, /ReplyExpected: yes/i, "guidelines should explain ReplyExpected semantics");
 assert.match(source, /parent task registry has already recorded/i, "child prompt should tell workers origin is already recorded");
 assert.match(source, /Main owns all outward replies/i, "child prompt should keep external communication with Main");
+assert.match(source, /sendCompletionFollowUp/i, "completion follow-up should go through a guarded helper");
+assert.match(source, /old runtime can no longer inject a follow-up message/i, "guard should document stale runtime reload safety");
 
 console.log("PiBackground self-documenting smoke test passed");

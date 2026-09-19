@@ -476,6 +476,19 @@ function completionMessage(task: BgTask): string {
   ].join("\n");
 }
 
+function sendCompletionFollowUp(pi: ExtensionAPI, task: BgTask): void {
+  try {
+    void Promise.resolve(pi.sendMessage(
+      { customType: "background-pi-task", content: completionMessage(task), display: true, details: task },
+      { deliverAs: "followUp", triggerTurn: true },
+    )).catch(() => undefined);
+  } catch {
+    // The parent session may have reloaded/replaced its extension context while a
+    // child was still running. Metadata/registry are already durable; never crash
+    // Pi just because the old runtime can no longer inject a follow-up message.
+  }
+}
+
 async function startBackgroundPi(params: BgStartParams, ctx: ExtensionContext, pi: ExtensionAPI): Promise<BgTask> {
   const id = makeId();
   const runtimeDir = join(backgroundDir(ctx.cwd), `session-${process.pid}`);
@@ -557,7 +570,7 @@ async function startBackgroundPi(params: BgStartParams, ctx: ExtensionContext, p
     output.end();
     await writeJson(metadataPath, task).catch(() => undefined);
     await updateTaskInRegistry(task).catch(() => undefined);
-    void pi.sendMessage({ customType: "background-pi-task", content: completionMessage(task), display: true, details: task }, { deliverAs: "followUp", triggerTurn: true });
+    sendCompletionFollowUp(pi, task);
   });
 
   child.on("close", async (code, signal) => {
@@ -570,7 +583,7 @@ async function startBackgroundPi(params: BgStartParams, ctx: ExtensionContext, p
     output.end();
     await writeJson(metadataPath, task).catch(() => undefined);
     await updateTaskInRegistry(task).catch(() => undefined);
-    void pi.sendMessage({ customType: "background-pi-task", content: completionMessage(task), display: true, details: task }, { deliverAs: "followUp", triggerTurn: true });
+    sendCompletionFollowUp(pi, task);
   });
 
   return task;
