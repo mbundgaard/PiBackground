@@ -1,0 +1,31 @@
+{
+  "name": "pi-background",
+  "version": "0.1.0",
+  "description": "Minimal Pi extension for starting one-shot background Pi subagents",
+  "main": "index.js",
+  "scripts": {
+    "test": "npm run typecheck && npm run test:smoke",
+    "test:smoke": "node --experimental-strip-types tests/isolation-smoke.test.ts && node --experimental-strip-types tests/registry-smoke.test.ts && node --experimental-strip-types tests/origin-smoke.test.ts && node --experimental-strip-types tests/self-documenting-smoke.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "dependencies": {
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
