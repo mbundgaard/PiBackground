@@ -1,0 +1,39 @@
+name: Publish npm package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: npm install --global npm@latest
+      - run: npm ci
+      - run: npm run validate
+      - run: npm run pack:check
+      - name: Check release tag matches package version
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: node --input-type=module -e "import fs from 'node:fs'; const {version} = JSON.parse(fs.readFileSync('package.json', 'utf8')); if (process.env.RELEASE_TAG !== 'v' + version) throw new Error('Release tag must be v' + version);"
+      - name: Publish through npm Trusted Publishing
+        shell: bash
+        run: |
+          npm --version
+          set +e
+          env -u NODE_AUTH_TOKEN -u NPM_TOKEN NPM_CONFIG_USERCONFIG=/dev/null npm publish --access public --provenance --loglevel=verbose > "$RUNNER_TEMP/npm-publish.log" 2>&1
+          result=$?
+          # Only print authentication diagnostics and publication status, not raw HTTP logs.
+          grep -E '^npm (verbose oidc|error (code|need auth)|notice (Publishing|publish))|^\+ ' "$RUNNER_TEMP/npm-publish.log" | sed -E 's/npm_[A-Za-z0-9]+/[REDACTED]/g; s/eyJ[A-Za-z0-9_.-]+/[REDACTED]/g' || true
+          exit "$result"
