@@ -13,13 +13,13 @@
     "subagents",
     "coding-agent"
   ],
-  "homepage": "https://github.com/mbundgaard/PiBackground#readme",
+  "homepage": "https://github.com/comput-sh/pi-background#readme",
   "bugs": {
-    "url": "https://github.com/mbundgaard/PiBackground/issues"
+    "url": "https://github.com/comput-sh/pi-background/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mbundgaard/PiBackground.git"
+    "url": "git+https://github.com/comput-sh/pi-background.git"
   },
   "files": [
     "src/**/*.ts",

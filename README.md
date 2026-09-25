@@ -13,7 +13,7 @@ pi install npm:@comput/pi-background
 Until then, install directly from GitHub:
 
 ```bash
-pi install git:github.com/mbundgaard/PiBackground
+pi install git:github.com/comput-sh/pi-background
 ```
 
 Start a new Pi session or run `/reload` after installation. Pi must be installed, authenticated, and available as `pi` on PATH so the extension can launch child processes. Node.js 20.3 or newer is required; development checks use Node.js 22 or 24.
@@ -78,7 +78,7 @@ CI checks type safety, smoke tests, and package contents on Windows and Linux wi
 This repository follows PiTelegram's public scoped-package and GitHub Actions Trusted Publishing approach. The intended npm name is `@comput/pi-background`; preparing this repository does not publish it.
 
 1. Ensure you have publish access to the `@comput` npm scope. If npm requires an initial package publication before configuring a trusted publisher, bootstrap it from a trusted local machine with `npm publish --access public --provenance=false` after validation. Authenticate locally; never commit credentials.
-2. In the npm package's Trusted Publisher settings, select GitHub Actions and configure owner `mbundgaard`, repository `PiBackground`, workflow filename `publish.yml`. The workflow does not use a GitHub environment.
+2. In the npm package's Trusted Publisher settings, select GitHub Actions and configure owner `comput-sh`, repository `pi-background`, workflow filename `publish.yml`. The workflow does not use a GitHub environment.
 3. Commit the source, metadata, and lockfile. For later versions, update both package files (for example, `npm version patch`).
 4. Publish a GitHub release tagged `v<package version>` (initially `v0.1.0`), or manually dispatch the publish workflow for an unpublished version.
 
