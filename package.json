@@ -1,6 +1,6 @@
 {
   "name": "@comput/pi-background",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Start one-shot background Pi subagents with durable task tracking and parent-owned follow-up.",
   "license": "MIT",
   "author": "Martin Bundgaard",

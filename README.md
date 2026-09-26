@@ -2,7 +2,7 @@
 
 Run background [Pi coding-agent](https://github.com/earendil-works/pi-mono) tasks, review their results in a durable session inbox, and schedule main or background work without execution backlogs.
 
-**Development status:** the inbox and scheduling features below are unreleased source changes. npm `0.1.0` provides the original `bg_start` behavior.
+**Version 0.2.0:** adds durable result inbox and session-owned scheduling. npm `0.1.0` provides the original `bg_start` behavior.
 
 ## Install
 
