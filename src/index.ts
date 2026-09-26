@@ -1,10 +1,13 @@
-import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { createWriteStream } from "node:fs";
+import { AsyncLocalStorage } from "node:async_hooks";
+import lockfile from "proper-lockfile";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getPackageDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { launchWorker, type WorkerResult } from "./worker.js";
+import { readSchedules, type Schedule } from "./schedules.js";
+import { registerRuntime } from "./runtime.js";
 
 type BgState = "running" | "completed" | "failed" | "killed" | "stale";
 type BgOriginSurface = "telegram" | "whatsapp" | "pi-console" | "scheduler" | "putio-downloader" | "media-mover" | "unknown";
@@ -29,7 +32,7 @@ interface BgTaskOrigin {
   correlation: Record<string, string>;
 }
 
-interface BgTask {
+export interface BgTask {
   id: string;
   name: string;
   scope: string;
@@ -45,6 +48,10 @@ interface BgTask {
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
   error?: string;
+  resultPath?: string;
+  stderrPath?: string;
+  scheduleId?: string;
+  acknowledgedAtUtc?: string;
 }
 
 interface BgRegistry {
@@ -53,12 +60,8 @@ interface BgRegistry {
   tasks: BgTask[];
 }
 
-const tasks = new Map<string, BgTask>();
-let currentCtx: ExtensionContext | undefined;
-
 const REGISTRY_FILE_NAME = "registry.json";
-const REGISTRY_LOCK_DIR_NAME = "registry.lock";
-const REGISTRY_LOCK_STALE_MS = 60_000;
+const lockGuard = new AsyncLocalStorage<() => void>();
 const REGISTRY_TASK_WITHOUT_PID_STALE_MS = 10 * 60_000;
 
 export const CHILD_ENV_FLAG = "PI_BACKGROUND_CHILD";
@@ -69,12 +72,20 @@ export const CHILD_DENIED_TOOLS = [
   "whatsapp_send_image",
   "whatsapp_set_busy",
   "telegram_send_file",
+  "telegram_send",
+  "telegram_send_photo",
+  "telegram_complete_setup",
   "telegram_start",
   "telegram_enable",
   "telegram_release",
   "telegram_remove_bot",
   // Children must not spawn more children unless explicitly reworked later.
   "bg_start",
+  "bg_inbox",
+  "bg_schedule_create",
+  "bg_schedule_list",
+  "bg_schedule_delete",
+  "bg_schedule_enable",
 ];
 
 const CHILD_DENIED_TOOL_SET = new Set(CHILD_DENIED_TOOLS);
@@ -147,8 +158,8 @@ export function childEnv(parentEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 const BgStartParams = Type.Object({
-  name: Type.String({ description: "Short human-readable name for this background Pi task." }),
-  prompt: Type.String({ description: "Complete prompt/task brief for the background Pi subagent." }),
+  name: Type.String({ maxLength: 200, description: "Short human-readable name for this background Pi task." }),
+  prompt: Type.String({ maxLength: 32000, description: "Complete prompt/task brief for the background Pi subagent." }),
   timeoutSeconds: Type.Optional(Type.Number({ description: "Optional timeout in seconds." })),
   provider: Type.Optional(Type.String({ description: "Optional Pi provider argument." })),
   model: Type.Optional(Type.String({ description: "Optional Pi model argument." })),
@@ -299,26 +310,24 @@ function registryPath(cwd: string): string {
   return join(backgroundDir(cwd), REGISTRY_FILE_NAME);
 }
 
-function registryLockDir(cwd: string): string {
-  return join(backgroundDir(cwd), REGISTRY_LOCK_DIR_NAME);
-}
-
-async function writeJson(path: string, value: unknown): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-}
-
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await rename(tmp, path);
+  try {
+    await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    lockGuard.getStore()?.();
+    await rename(tmp, path);
+  } finally { await rm(tmp, { force: true }).catch(() => undefined); }
 }
 
 async function readRegistry(path: string): Promise<BgRegistry> {
   try {
     const text = await readFile(path, "utf8");
     const parsed = JSON.parse(text) as Partial<BgRegistry>;
+    if (parsed.version !== 1 || !Array.isArray(parsed.tasks) || parsed.tasks.some(task =>
+      !task || typeof task.id !== "string" || !task.origin || !["running", "completed", "failed", "killed", "stale"].includes(task.state))) {
+      throw new Error("Invalid Pi Background registry; refusing to overwrite");
+    }
     return {
       version: 1,
       updatedAtUtc: typeof parsed.updatedAtUtc === "string" ? parsed.updatedAtUtc : new Date(0).toISOString(),
@@ -367,59 +376,23 @@ export function reapStaleRegistryTasks(
   return changed ? { ...registry, updatedAtUtc: new Date(nowMs).toISOString(), tasks } : registry;
 }
 
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function readLockPid(lockDir: string): Promise<number | undefined> {
-  try {
-    const text = await readFile(join(lockDir, "owner.json"), "utf8");
-    const owner = JSON.parse(text) as { pid?: unknown };
-    return typeof owner.pid === "number" ? owner.pid : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-async function isLockStale(lockDir: string): Promise<boolean> {
-  const pid = await readLockPid(lockDir);
-  if (typeof pid === "number" && !isPidAlive(pid)) return true;
-  try {
-    const text = await readFile(join(lockDir, "owner.json"), "utf8");
-    const owner = JSON.parse(text) as { createdAtUtc?: unknown };
-    const createdMs = typeof owner.createdAtUtc === "string" ? Date.parse(owner.createdAtUtc) : Number.NaN;
-    return !Number.isFinite(createdMs) || Date.now() - createdMs > REGISTRY_LOCK_STALE_MS;
-  } catch {
-    return true;
-  }
-}
-
-async function withRegistryLock<T>(cwd: string, run: (registryFile: string) => Promise<T>): Promise<T> {
-  const lockDir = registryLockDir(cwd);
-  const registryFile = registryPath(cwd);
+export async function withRegistryLock<T>(cwd: string, run: (registryFile: string) => Promise<T>): Promise<T> {
   await mkdir(backgroundDir(cwd), { recursive: true });
-  const deadline = Date.now() + 10_000;
-  while (true) {
-    try {
-      await mkdir(lockDir);
-      await writeJson(join(lockDir, "owner.json"), { pid: process.pid, createdAtUtc: new Date().toISOString() });
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (await isLockStale(lockDir)) {
-        await rm(lockDir, { recursive: true, force: true });
-        continue;
-      }
-      if (Date.now() > deadline) throw new Error("Timed out waiting for PiBackground registry lock");
-      await sleep(100);
-    }
-  }
-
+  let compromised: Error | undefined;
+  const release = await lockfile.lock(backgroundDir(cwd), {
+    lockfilePath: join(backgroundDir(cwd), ".state.lock"),
+    stale: 120_000, update: 10_000,
+    retries: { retries: 100, factor: 1, minTimeout: 100, maxTimeout: 100 },
+    onCompromised: error => { compromised = error; },
+  });
+  const check = () => { if (compromised) throw compromised; };
   try {
-    return await run(registryFile);
-  } finally {
-    await rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
-  }
+    return await lockGuard.run(check, async () => {
+      const value = await run(registryPath(cwd));
+      check();
+      return value;
+    });
+  } finally { await release().catch(error => { if (!compromised) throw error; }); }
 }
 
 async function registerTaskStart(task: BgTask): Promise<void> {
@@ -444,7 +417,7 @@ async function updateTaskInRegistry(task: BgTask): Promise<void> {
     const next: BgRegistry = {
       version: 1,
       updatedAtUtc: new Date().toISOString(),
-      tasks: registry.tasks.map((entry) => entry.id === task.id ? task : entry),
+      tasks: registry.tasks.map((entry) => entry.id === task.id ? { ...task, acknowledgedAtUtc: entry.acknowledgedAtUtc } : entry),
     };
     if (!next.tasks.some((entry) => entry.id === task.id)) next.tasks.push(task);
     await writeJsonAtomic(file, next);
@@ -455,58 +428,37 @@ function textResult(text: string, details: Record<string, unknown> = {}) {
   return { content: [{ type: "text" as const, text }], details };
 }
 
-function completionMessage(task: BgTask): string {
-  const status = task.state;
-  const outcome = status === "completed" ? "completed" : `${status}${task.error ? `: ${task.error}` : ""}`;
-  return [
-    "<background-pi-task>",
-    `TaskId: ${task.id}`,
-    `Name: ${task.name}`,
-    `Status: ${outcome}`,
-    `OriginSurface: ${task.origin.surface}`,
-    `OriginRequestId: ${task.origin.requestId ?? ""}`,
-    `ReplyExpected: ${task.origin.replyExpected ? "yes" : "no"}`,
-    `ReplyPolicy: ${task.origin.replyPolicy}`,
-    `OutputPath: ${task.outputPath}`,
-    `MetadataPath: ${task.metadataPath}`,
-    "",
-    "Message:",
-    "A background Pi task reached terminal state. Read the output path if the result is needed.",
-    "</background-pi-task>",
-  ].join("\n");
-}
-
-function sendCompletionFollowUp(pi: ExtensionAPI, task: BgTask): void {
-  try {
-    void Promise.resolve(pi.sendMessage(
-      { customType: "background-pi-task", content: completionMessage(task), display: true, details: task },
-      { deliverAs: "followUp", triggerTurn: true },
-    )).catch(() => undefined);
-  } catch {
-    // The parent session may have reloaded/replaced its extension context while a
-    // child was still running. Metadata/registry are already durable; never crash
-    // Pi just because the old runtime can no longer inject a follow-up message.
+export async function startBackgroundPi(
+  params: BgStartParams, ctx: ExtensionContext, alive: () => boolean = () => true,
+  scheduleId?: string, launch: typeof launchWorker = launchWorker,
+): Promise<BgTask> {
+  if (isBackgroundChild()) throw new Error("Background children cannot start workers");
+  if (!params.name.trim() || !params.prompt.trim()) throw new Error("Name and prompt are required");
+  if (params.timeoutSeconds !== undefined && (!Number.isFinite(params.timeoutSeconds) || params.timeoutSeconds <= 0 || params.timeoutSeconds > 2_147_483)) {
+    throw new Error("timeoutSeconds must be positive and at most 2147483");
   }
-}
-
-async function startBackgroundPi(params: BgStartParams, ctx: ExtensionContext, pi: ExtensionAPI): Promise<BgTask> {
+  const ownerSessionId = ctx.sessionManager.getSessionId();
+  if (!ownerSessionId) throw new Error("A session ID is required");
   const id = makeId();
   const runtimeDir = join(backgroundDir(ctx.cwd), `session-${process.pid}`);
   await mkdir(runtimeDir, { recursive: true });
 
   const safeName = sanitizePathSegment(params.name);
-  const scope = normalizeTaskScope(params.name);
+  const scope = scheduleId ? `schedule:${ownerSessionId}:${scheduleId}` : normalizeTaskScope(params.name);
   const promptPath = join(runtimeDir, `${id}-${safeName}.prompt.md`);
-  const outputPath = join(runtimeDir, `${id}.output.md`);
+  const outputPath = join(runtimeDir, `${id}.events.jsonl`);
+  const stderrPath = join(runtimeDir, `${id}.stderr.log`);
+  const resultPath = join(runtimeDir, `${id}.result.json`);
   const metadataPath = join(runtimeDir, `${id}.json`);
 
   const childPrompt = `${params.prompt.trim()}\n\n---\nBackground task instructions:\n- You are a background Pi subagent.\n- Work independently and return a concise final result.\n- The parent task registry has already recorded where the spawning request came from; do not infer, choose, or mention reply destinations unless the task itself explicitly asks for origin analysis.\n- Do not send WhatsApp/Telegram messages, call bridge endpoints, or rely on inbound push ports. Main owns all outward replies and follow-up decisions.\n- If you change files, clearly list changed paths and validation performed.\n`;
-  await writeFile(promptPath, childPrompt, "utf8");
+  await writeFile(promptPath, childPrompt, { encoding: "utf8", mode: 0o600 });
 
   const args = [
+    join(getPackageDir(), "dist", "cli.js"),
     "--print",
-    "--session-id",
-    id,
+    "--mode", "json",
+    "--no-session",
     "--name",
     `BG: ${params.name}`,
     "--exclude-tools",
@@ -518,7 +470,10 @@ async function startBackgroundPi(params: BgStartParams, ctx: ExtensionContext, p
   args.push(`@${promptPath}`);
 
   const env = childEnv(process.env);
-  const origin = detectOriginFromContext(ctx);
+  const origin: BgTaskOrigin = scheduleId ? {
+    surface: "scheduler", sessionId: ownerSessionId, spawnedAtUtc: new Date().toISOString(),
+    requestId: scheduleId, replyExpected: false, replyPolicy: "main-review", correlation: { scheduleId },
+  } : detectOriginFromContext(ctx);
 
   const task: BgTask = {
     id,
@@ -529,67 +484,106 @@ async function startBackgroundPi(params: BgStartParams, ctx: ExtensionContext, p
     cwd: ctx.cwd,
     promptPath,
     outputPath,
-    metadataPath,
+    metadataPath, resultPath, stderrPath, scheduleId,
     startedAtUtc: new Date().toISOString(),
   };
-  tasks.set(id, task);
   await registerTaskStart(task);
-  await writeJson(metadataPath, task);
-
-  const output = createWriteStream(outputPath, { flags: "a", encoding: "utf8" });
-  const child = spawn("pi", args, {
-    cwd: ctx.cwd,
-    env,
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-    shell: process.platform === "win32",
-  });
-
-  task.pid = child.pid;
-  await writeJson(metadataPath, task);
-  await updateTaskInRegistry(task).catch(() => undefined);
-
-  child.stdout?.pipe(output, { end: false });
-  child.stderr?.pipe(output, { end: false });
-
-  let timeout: NodeJS.Timeout | undefined;
-  if (params.timeoutSeconds && Number.isFinite(params.timeoutSeconds) && params.timeoutSeconds > 0) {
-    timeout = setTimeout(() => {
-      if (task.state !== "running") return;
-      task.state = "killed";
-      task.error = `Timed out after ${Math.floor(params.timeoutSeconds!)} seconds`;
-      try { child.kill(); } catch { /* noop */ }
-    }, Math.floor(params.timeoutSeconds) * 1000);
+  const finish = async (result: WorkerResult) => {
+    task.state = result.status;
+    task.error = result.error;
+    task.exitCode = result.exitCode;
+    task.signal = result.signal;
+    task.completedAtUtc = new Date().toISOString();
+    // Result first: recovery can reconstruct registry completion after a crash.
+    await writeJsonAtomic(resultPath, { version: 1, taskId: id, ownerSessionId, completedAtUtc: task.completedAtUtc, ...result });
+    await writeJsonAtomic(metadataPath, task);
+    await updateTaskInRegistry(task);
+    // No captured Pi API here: the old runtime can no longer inject a follow-up message.
+    // A live, session-bound inbox poll will discover the durable completion instead.
+  };
+  try {
+    await writeJsonAtomic(metadataPath, task);
+    if (!alive()) throw new Error("Owning session is no longer active");
+    const { child, completion } = launch({ command: process.execPath, args, cwd: ctx.cwd, env,
+      outputPath, stderrPath, timeoutSeconds: params.timeoutSeconds });
+    task.pid = child.pid;
+    // Attach completion immediately, but serialize it after the PID write.
+    const pidWrite = writeJsonAtomic(metadataPath, task).then(() => updateTaskInRegistry(task));
+    void completion.then(async result => {
+      await pidWrite.catch(() => undefined);
+      await finish(result);
+    }).catch(error => console.error(`Pi Background result persistence failed for ${id}: ${String(error)}`));
+    await pidWrite;
+  } catch (error) {
+    // A PID means the worker is already running; never mark it terminal prematurely.
+    if (!task.pid) await finish({ status: "failed", finalAnswer: "", error: String(error), exitCode: null, signal: null });
+    throw error;
   }
-
-  child.on("error", async (error) => {
-    task.state = "failed";
-    task.error = error.message;
-    task.completedAtUtc = new Date().toISOString();
-    output.write(`\n[spawn error: ${error.message}]\n`);
-    output.end();
-    await writeJson(metadataPath, task).catch(() => undefined);
-    await updateTaskInRegistry(task).catch(() => undefined);
-    sendCompletionFollowUp(pi, task);
-  });
-
-  child.on("close", async (code, signal) => {
-    if (timeout) clearTimeout(timeout);
-    if (task.state === "running") task.state = code === 0 ? "completed" : "failed";
-    task.exitCode = code;
-    task.signal = signal;
-    if (task.state === "failed" && !task.error) task.error = `Exited with code ${code ?? "null"}${signal ? ` (${signal})` : ""}`;
-    task.completedAtUtc = new Date().toISOString();
-    output.end();
-    await writeJson(metadataPath, task).catch(() => undefined);
-    await updateTaskInRegistry(task).catch(() => undefined);
-    sendCompletionFollowUp(pi, task);
-  });
-
   return task;
 }
 
+export async function ownedTasks(cwd: string, sessionId: string): Promise<BgTask[]> {
+  return withRegistryLock(cwd, async file => {
+    const original = await readRegistry(file);
+    const before = JSON.stringify(original);
+    const registry = reapStaleRegistryTasks(original);
+    for (const task of registry.tasks) {
+      if (task.origin?.sessionId !== sessionId || !task.resultPath || !["running", "stale"].includes(task.state)) continue;
+      try {
+        const result = await readTaskResult(task);
+        task.state = result.status;
+        task.error = result.error;
+        task.exitCode = result.exitCode;
+        task.signal = result.signal;
+        task.completedAtUtc = result.completedAtUtc;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    if (before !== JSON.stringify(registry)) {
+      registry.updatedAtUtc = new Date().toISOString();
+      await writeJsonAtomic(file, registry);
+    }
+    return registry.tasks.filter(task => task.origin?.sessionId === sessionId);
+  });
+}
+
+export async function readTaskResult(task: BgTask): Promise<WorkerResult & { completedAtUtc?: string }> {
+  if (!task.resultPath) return { status: "failed", finalAnswer: "", error: "Legacy task: inspect its output log", exitCode: task.exitCode ?? null, signal: task.signal ?? null };
+  const result = JSON.parse(await readFile(task.resultPath, "utf8"));
+  if (result.version !== 1 || result.taskId !== task.id || result.ownerSessionId !== task.origin.sessionId
+    || !["completed", "failed", "killed"].includes(result.status) || typeof result.finalAnswer !== "string") {
+    throw new Error("Invalid task result identity or format");
+  }
+  return result;
+}
+
+export async function acknowledgeTask(cwd: string, sessionId: string, id: string): Promise<void> {
+  await withRegistryLock(cwd, async file => {
+    const registry = await readRegistry(file);
+    const task = registry.tasks.find(t => t.id === id && t.origin?.sessionId === sessionId);
+    if (!task || task.state === "running") throw new Error("No completed task with that ID belongs to this session");
+    task.acknowledgedAtUtc ??= new Date().toISOString();
+    await writeJsonAtomic(file, registry);
+  });
+}
+
+export async function changeSchedules<T>(cwd: string, change: (schedules: Schedule[]) => T): Promise<T> {
+  return withRegistryLock(cwd, async () => {
+    const file = join(backgroundDir(cwd), "schedules.json");
+    const schedules = await readSchedules(file);
+    const before = JSON.stringify(schedules);
+    const result = change(schedules);
+    if (before !== JSON.stringify(schedules)) await writeJsonAtomic(file, { version: 1, schedules });
+    return result;
+  });
+}
+
 export default function piBackground(pi: ExtensionAPI): void {
+  let currentCtx: ExtensionContext | undefined;
+  const runtime = registerRuntime(pi, {
+    child: isBackgroundChild(), ownedTasks, readTaskResult, acknowledgeTask, changeSchedules, startBackgroundPi,
+  });
   if (isBackgroundChild()) {
     pi.on("session_start", async (_event, ctx) => {
       currentCtx = ctx;
@@ -626,7 +620,7 @@ export default function piBackground(pi: ExtensionAPI): void {
     async execute(_toolCallId, params: BgStartParams, _signal, _onUpdate, ctx) {
       const effectiveCtx = ctx ?? currentCtx;
       if (!effectiveCtx) throw new Error("No active Pi extension context");
-      const task = await startBackgroundPi(params, effectiveCtx, pi);
+      const task = await startBackgroundPi(params, effectiveCtx, runtime.guard(effectiveCtx));
       return textResult([
         `Started background Pi task ${task.id}`,
         `Name: ${task.name}`,
